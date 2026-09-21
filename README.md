@@ -1,7 +1,14 @@
 # JSON Schema 反例最小化 API
 
-基于 **Python + FastAPI** 的确定性反例（counterexample）最小化服务。
-给定一份 JSON Schema 和一个**未通过校验**的 JSON 实例，服务会：
+基于 **Python + FastAPI** 的确定性反例（counterexample）工具服务，提供两个接口：
+
+- **`POST /minimize`**：给定 JSON Schema 和一个**未通过校验**的实例，做确定性
+  delta debugging 最小化，锁定首个校验错误的关键字，只保留仍触发同一关键字的候选；
+- **`POST /mutations`**：给定 JSON Schema 和一个**合法样例**，确定性生成覆盖
+  `required` / `type` / `minItems` / `minLength` / 数值边界 / `enum` 等约束的
+  **最小变异实例**，每个变异携带 JSON Pointer、预期触发关键字与可复现 seed。
+
+`/minimize` 的工作流程：
 
 1. **锁定首个校验错误的关键字**（keyword，如 `required` / `type` / `minItems`）；
 2. 用**确定性 delta debugging** 反复尝试：
@@ -13,6 +20,17 @@
 3. **只保留仍触发同一关键字的候选**；如果候选变成合法实例、或首个错误换成了
    别的关键字，则丢弃该候选；
 4. 返回最小实例、完整评估轨迹，以及是否因评估预算提前停止。
+
+`/mutations` 的工作流程：
+
+1. 校验样例必须**合法**（否则 422），随后沿 schema 的 applicator
+   （`properties` / `patternProperties` / `additionalProperties` / `items` /
+   `prefixItems` / `allOf` / 本地 `$ref`）与样例结构同步遍历；
+2. 为每个适用的约束关键字生成确定性的候选变异（每个变异只改动**一个位置**，
+   且取边界外最近值，例如 `minItems: 3` 截断到 2 个元素、`minimum: 5` 改为 4）；
+3. 每个候选都用真实校验器验证：**只有首个校验错误的关键字与预期一致才被接受**
+   （与 `/minimize` 的锁定语义一致），无法构造的关键字列入 `skipped`；
+4. 同一变异实例去重，每个变异返回 JSON Pointer、预期触发关键字和可复现 seed。
 
 整个过程不使用任何随机源，相同输入必然得到相同结果（依赖版本已锁定）。
 
@@ -108,6 +126,76 @@ docker compose up --build -d   # 然后访问 http://localhost:9000
 
 ---
 
+### `POST /mutations`
+
+给定 JSON Schema 与一个**合法样例**，确定性生成覆盖各类约束关键字的最小变异实例。
+
+请求体：
+
+| 字段              | 类型             | 必填 | 说明                                                                 |
+| ----------------- | ---------------- | ---- | -------------------------------------------------------------------- |
+| `schema`          | object / boolean | 是   | JSON Schema（支持 Draft 3/4/6/7/2019-09/2020-12，含布尔 schema）    |
+| `instance`        | 任意 JSON        | 是   | **合法**样例（必须通过 schema 校验），作为所有变异的起点             |
+| `seed`            | 任意 JSON        | 否   | 复现种子；相同 `(schema, instance, seed)` 必然得到相同响应           |
+| `max_evaluations` | integer          | 否   | 最大校验评估次数（**含对样例的首次校验**），默认/上限见配置表，≥ 1   |
+
+#### 覆盖的约束关键字
+
+| 关键字                                                | 变异方式                                                     |
+| ----------------------------------------------------- | ------------------------------------------------------------ |
+| `required`                                            | 删除单个必填属性（每个必填属性一个变异）                     |
+| `type`                                                | 替换为确定性的异型哨兵值（`null` / `true` / `0` / …）        |
+| `enum` / `const`                                      | 替换为取值集合外的确定性哨兵值（优先同类型）                 |
+| `minimum` / `maximum`                                 | 取边界外最近值（整型样例优先保持整型）                       |
+| `exclusiveMinimum` / `exclusiveMaximum`（draft 6+）   | 取边界值本身；draft 4 布尔形式由 `minimum`/`maximum` 覆盖    |
+| `multipleOf`                                          | 破坏整除性的最近值                                           |
+| `minLength` / `maxLength`                             | 截断 / 填充到边界外一个字符                                  |
+| `minItems` / `maxItems`                               | 截断 / 填充到边界外一个元素                                  |
+| `minProperties` / `maxProperties`                     | 删 / 增属性到边界外一个（删除时优先保留 `required` 键）      |
+
+遍历会跟随 `properties`、`patternProperties`、`additionalProperties`、`items`
+（含旧版 tuple form）、`prefixItems`、`allOf` 与本地 `$ref`（`#` / `#/...`，带环保护）。
+`pattern` 与 `uniqueItems` 识别但暂不支持构造，会列入 `skipped`；
+`anyOf` / `oneOf` / `not` / `if` / `format` 等不参与遍历。
+
+#### 响应 `200`
+
+| 字段                | 说明                                                                       |
+| ------------------- | -------------------------------------------------------------------------- |
+| `mutations[]`       | 变异列表（见下），按确定性遍历顺序排列                                     |
+| `skipped[]`         | 无法构造变异的关键字及原因（如 `minItems: 0`、被其他约束抢先拦截）         |
+| `seed`              | 本次请求的 base seed（由 `(schema, instance, seed)` 派生的 16 位十六进制） |
+| `evaluations`       | 实际消耗的校验评估次数                                                     |
+| `stopped_by_budget` | `true` 表示因评估预算耗尽提前停止，剩余目标已进入 `skipped`                |
+
+`mutations[]` 条目字段：
+
+| 字段               | 说明                                                                       |
+| ------------------ | -------------------------------------------------------------------------- |
+| `index`            | 变异序号，从 1 开始                                                        |
+| `pointer`          | 变异位置的 JSON Pointer（相对**原始**样例；`required` 指向被删除的属性）   |
+| `expected_keyword` | 预期触发关键字：保证该变异的**首个**校验错误关键字与此一致                 |
+| `instance`         | 变异后的完整实例（单点最小改动）                                           |
+| `seed`             | 该变异的可复现 seed（16 位十六进制）；重新发送相同请求即可复现             |
+| `detail`           | 人类可读的变异描述                                                         |
+| `error_pointer`    | 首个校验错误所在位置的 JSON Pointer                                        |
+
+`skipped[]` 条目字段：`pointer` / `keyword` / `reason`。
+
+#### 错误响应（均为 `422`）
+
+- 样例**未通过** schema 校验：
+
+  ```json
+  { "error": "instance_invalid", "message": "...", "keyword": "type", "instance_path": "/a" }
+  ```
+
+- schema 自身不合法或无法用于校验（如坏 `$ref`）：
+  `{ "error": "invalid_schema", "message": "...", "path": [...] }`
+- 请求体缺少必填字段、`max_evaluations` 越界等：FastAPI/Pydantic 标准 422 结构。
+
+---
+
 ## 使用示例
 
 ```bash
@@ -150,6 +238,55 @@ r = httpx.post(
     },
 )
 print(r.status_code, r.json()["minimal_instance"])  # 200 []
+```
+
+### `/mutations` 示例
+
+```bash
+curl -s -X POST http://localhost:8000/mutations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "schema": {"type":"object","required":["id"],"properties":{"id":{"type":"integer","minimum":1},"tags":{"type":"array","minItems":2}}},
+    "instance": {"id": 10, "tags": ["a","b","c"]},
+    "seed": "demo"
+  }'
+```
+
+响应（节选）：`required` / `type` / `minimum` / `minItems` 各得到一个最小变异，
+每个变异都保证首个校验错误关键字与 `expected_keyword` 一致：
+
+```json
+{
+  "mutations": [
+    {"index": 1, "pointer": "/id",   "expected_keyword": "required", "instance": {"tags": ["a","b","c"]},       "seed": "69810f73d39582b1", "detail": "remove required property 'id'", "error_pointer": ""},
+    {"index": 3, "pointer": "/id",   "expected_keyword": "type",     "instance": {"id": null, "tags": ["a","b","c"]}, "seed": "0d42184afb4c5c15", "detail": "replace 10 with None",   "error_pointer": "/id"},
+    {"index": 4, "pointer": "/id",   "expected_keyword": "minimum",  "instance": {"id": 0, "tags": ["a","b","c"]},    "seed": "5bc77c1122bf4513", "detail": "set to 0 (< minimum 1)", "error_pointer": "/id"},
+    {"index": 6, "pointer": "/tags", "expected_keyword": "minItems", "instance": {"id": 10, "tags": ["a"]},           "seed": "890019db2adc303a", "detail": "truncate array 3 -> 1 items", "error_pointer": "/tags"}
+  ],
+  "skipped": [],
+  "seed": "a264bd17a0ab56bd",
+  "evaluations": 7,
+  "stopped_by_budget": false
+}
+```
+
+Python 调用：
+
+```python
+import httpx
+
+r = httpx.post(
+    "http://localhost:8000/mutations",
+    json={
+        "schema": {"type": "string", "minLength": 3},
+        "instance": "hello",           # 合法样例
+        "seed": "my-run",
+    },
+)
+for m in r.json()["mutations"]:
+    print(m["pointer"], m["expected_keyword"], repr(m["instance"]), m["seed"])
+#  type None <seed>
+#  minLength 'he' <seed>
 ```
 
 ---
@@ -196,9 +333,12 @@ python -m pytest -q
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 应用、请求/响应模型、配置
-│   └── minimizer.py     # 确定性 delta debugging 最小化内核
-├── tests/test_api.py    # 单元与端到端测试
+│   ├── main.py             # FastAPI 应用、请求/响应模型、配置
+│   ├── minimizer.py        # 确定性 delta debugging 最小化内核
+│   └── mutator.py          # 确定性约束变异生成器（/mutations）
+├── tests/
+│   ├── test_api.py         # /minimize 单元与端到端测试
+│   └── test_mutations.py   # /mutations 单元与端到端测试
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .dockerignore
