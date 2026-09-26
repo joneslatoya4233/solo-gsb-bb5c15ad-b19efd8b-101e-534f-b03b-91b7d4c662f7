@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from jsonschema.exceptions import SchemaError
 
 from .minimizer import Minimizer, build_validator
+from .mutator import generate_mutations
 
 # ---- 配置（全部可通过环境变量覆盖）----------------------------------------
 
@@ -21,13 +22,14 @@ app = FastAPI(
     title="JSON Schema Counterexample Minimizer",
     description=(
         "对未通过 JSON Schema 校验的实例做确定性 delta debugging 最小化，"
-        "锁定首个校验错误的关键字，只保留仍触发同一关键字的候选。"
+        "锁定首个校验错误的关键字，只保留仍触发同一关键字的候选；"
+        "也可以给定合法样例，确定性生成覆盖各约束关键字的最小变异实例。"
     ),
     version="1.0.0",
 )
 
 
-class MinimizeRequest(BaseModel):
+class SchemaBoundRequest(BaseModel):
     # JSON Schema 本身可以是 object 或 boolean（true/false schema）。
     # 字段名避开 BaseModel.schema，JSON 键通过 alias 保持为 "schema"。
     schema_: Annotated[
@@ -35,9 +37,12 @@ class MinimizeRequest(BaseModel):
         Field(
             alias="schema",
             title="JSON Schema",
-            description="待针对校验的 JSON Schema，支持 draft 3/4/6/7/2019-09/2020-12。",
+            description="JSON Schema，支持 draft 3/4/6/7/2019-09/2020-12。",
         ),
     ]
+
+
+class MinimizeRequest(SchemaBoundRequest):
     instance: Any = Field(
         ...,
         title="未通过校验的 JSON 实例",
@@ -49,6 +54,22 @@ class MinimizeRequest(BaseModel):
         description=(
             "最大校验评估次数（含对原实例的首次校验）；"
             f"默认 {DEFAULT_MAX_EVALUATIONS}，硬上限 {HARD_MAX_EVALUATIONS}。"
+        ),
+    )
+
+
+class MutationsRequest(SchemaBoundRequest):
+    instance: Any = Field(
+        ...,
+        title="通过校验的合法 JSON 样例（变异基线）",
+    )
+    seed: int = Field(
+        default=0,
+        ge=0,
+        le=2_147_483_647,
+        description=(
+            "seed 基数：第 i 个变异的 seed = seed + i。生成全程无随机源，"
+            "相同 schema + instance + seed 重放必然得到相同响应。"
         ),
     )
 
@@ -94,3 +115,40 @@ def minimize(req: MinimizeRequest) -> JSONResponse:
 
     result = minimizer.minimize()
     return JSONResponse(status_code=200, content=result.to_dict())
+
+
+@app.post("/mutations")
+def mutations(req: MutationsRequest) -> JSONResponse:
+    # schema 自身不合法：返回 422。
+    try:
+        validator = build_validator(req.schema_)
+    except SchemaError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_schema",
+                "message": exc.message,
+                "path": list(exc.absolute_path),
+            },
+        )
+
+    # 样例必须合法：变异以合法样例为基线，非法样例请改用 /minimize。
+    first_error = next(iter(validator.iter_errors(req.instance)), None)
+    if first_error is not None:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "instance_invalid",
+                "message": "样例未通过 schema 校验；本接口需要合法样例作为变异基线，非法实例请使用 /minimize。",
+                "first_error": {
+                    "keyword": first_error.validator,
+                    "path": list(first_error.absolute_path),
+                    "message": first_error.message,
+                },
+            },
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content=generate_mutations(validator, req.instance, req.seed),
+    )
